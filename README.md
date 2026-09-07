@@ -775,6 +775,10 @@ are documented in [docs/RELEASING.md](docs/RELEASING.md).
 - **QR Code Not Displaying**: Restart the bridge. Check terminal QR code support.
 - **Device Limit Reached**: Remove a linked device from WhatsApp Settings > Linked Devices.
 - **No Messages Loading**: Initial sync can take several minutes for large chat histories.
+- **MCP tools fail with `WhatsApp messages database not found`**: The MCP
+  server opens `messages.db` read-only and refuses to create it. Start the
+  bridge once so it creates `whatsapp-bridge/store/messages.db`, or set
+  `WHATSAPP_DB_PATH` to wherever it lives.
 - **Out of Sync**: Back up `whatsapp-bridge/store`, then move
   `whatsapp-bridge/store/whatsapp.db` aside and re-authenticate. Keep
   `messages.db` unless you intentionally want to discard local message history.
