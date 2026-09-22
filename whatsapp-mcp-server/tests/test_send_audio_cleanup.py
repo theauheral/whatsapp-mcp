@@ -18,8 +18,8 @@ class _Resp:
         return self._payload
 
 
-@pytest.mark.parametrize("status_code", [200, 500])
-def test_send_audio_removes_converted_temp_file(tmp_path, monkeypatch, status_code):
+@pytest.mark.parametrize(("status_code", "expected_success"), [(200, True), (500, False)])
+def test_send_audio_removes_converted_temp_file(tmp_path, monkeypatch, status_code, expected_success):
     src = tmp_path / "voice.mp3"
     src.write_bytes(b"not really mp3")
     converted = tmp_path / "converted.ogg"
@@ -31,8 +31,32 @@ def test_send_audio_removes_converted_temp_file(tmp_path, monkeypatch, status_co
     monkeypatch.setattr(whatsapp.audio, "convert_to_opus_ogg_temp", fake_convert)
     monkeypatch.setattr(whatsapp.requests, "post", lambda *a, **k: _Resp(status_code=status_code))
 
-    whatsapp.send_audio_message("12025551234", str(src))
+    success, _ = whatsapp.send_audio_message("12025551234", str(src))
 
+    assert success is expected_success
+    assert not os.path.exists(converted)
+    assert src.exists()  # the caller's original file is never touched
+
+
+def test_send_audio_removes_converted_temp_file_after_request_exception(tmp_path, monkeypatch):
+    src = tmp_path / "voice.mp3"
+    src.write_bytes(b"not really mp3")
+    converted = tmp_path / "converted.ogg"
+
+    def fake_convert(path):
+        converted.write_bytes(b"ogg")
+        return str(converted)
+
+    def raise_request_exception(*args, **kwargs):
+        raise whatsapp.requests.RequestException("bridge unavailable")
+
+    monkeypatch.setattr(whatsapp.audio, "convert_to_opus_ogg_temp", fake_convert)
+    monkeypatch.setattr(whatsapp.requests, "post", raise_request_exception)
+
+    success, message = whatsapp.send_audio_message("12025551234", str(src))
+
+    assert success is False
+    assert message == "Request error: bridge unavailable"
     assert not os.path.exists(converted)
     assert src.exists()  # the caller's original file is never touched
 
