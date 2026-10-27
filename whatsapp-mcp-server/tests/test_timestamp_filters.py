@@ -3,6 +3,8 @@
 The bridge stores messages.timestamp with the bridge host's UTC offset. A
 lexicographic comparison against a UTC or naive bound is off by that offset,
 so e.g. after="09:00Z" used to admit a message stamped "10:00+02:00" (08:00Z).
+Normalising through SQLite's date functions alone would fix the offset but
+collapse distinct instants within one millisecond.
 """
 
 import sqlite3
@@ -23,8 +25,15 @@ ROWS = [
 ]
 
 
-@pytest.fixture
-def tz_db(tmp_path, monkeypatch):
+# Distinct instants inside one millisecond, the earlier one stored at +02:00.
+# SQLite's date functions keep only milliseconds and would read them as equal.
+SAME_MS_ROWS = [
+    ("m-1233", "2024-01-15 14:00:00.1233+02:00", "12:00:00.1233Z"),
+    ("m-1234", "2024-01-15 12:00:00.1234+00:00", "12:00:00.1234Z"),
+]
+
+
+def _make_db(tmp_path, monkeypatch, rows):
     db_path = tmp_path / "messages.db"
     conn = sqlite3.connect(db_path)
     conn.executescript(
@@ -37,8 +46,8 @@ def tz_db(tmp_path, monkeypatch):
         );
         """
     )
-    conn.execute("INSERT INTO chats VALUES (?, ?, ?, ?)", (CHAT, "Alice", ROWS[-1][1], None))
-    for msg_id, ts, _ in ROWS:
+    conn.execute("INSERT INTO chats VALUES (?, ?, ?, ?)", (CHAT, "Alice", rows[-1][1], None))
+    for msg_id, ts, _ in rows:
         conn.execute(
             "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, 0)",
             (msg_id, CHAT, "15551234567", msg_id, ts),
@@ -47,6 +56,16 @@ def tz_db(tmp_path, monkeypatch):
     conn.close()
     monkeypatch.setattr(whatsapp, "MESSAGES_DB_PATH", str(db_path))
     return db_path
+
+
+@pytest.fixture
+def tz_db(tmp_path, monkeypatch):
+    return _make_db(tmp_path, monkeypatch, ROWS)
+
+
+@pytest.fixture
+def same_ms_db(tmp_path, monkeypatch):
+    return _make_db(tmp_path, monkeypatch, SAME_MS_ROWS)
 
 
 def _ids(**kwargs):
@@ -91,8 +110,38 @@ def test_invalid_bound_raises_value_error(tz_db):
         whatsapp.list_messages(after="yesterday", include_context=False)
 
 
-def test_utc_bound_formats_milliseconds():
-    assert whatsapp._utc_bound("2024-01-15T10:00:00.5+02:00", "after") == "2024-01-15 08:00:00.500"
-    assert whatsapp._utc_bound("2024-01-15T10:00:00Z", "after") == "2024-01-15 10:00:00.000"
+def test_before_keeps_sub_millisecond_precision(same_ms_db):
+    assert _ids(before="2024-01-15T12:00:00.123400Z") == ["m-1233"]
+
+
+def test_after_keeps_sub_millisecond_precision(same_ms_db):
+    assert _ids(after="2024-01-15T12:00:00.123300Z") == ["m-1234"]
+
+
+def test_bound_keeps_digits_beyond_microseconds(same_ms_db):
+    # .12340001 is 10ns after m-1234; datetime alone would truncate it to .123400.
+    assert _ids(after="2024-01-15T12:00:00.12340001Z") == []
+    assert _ids(before="2024-01-15T12:00:00.12340001Z") == ["m-1233", "m-1234"]
+
+
+def test_utc_bound_formats_nanoseconds():
+    assert whatsapp._utc_bound("2024-01-15T10:00:00.5+02:00", "after") == "2024-01-15 08:00:00.500000000"
+    assert whatsapp._utc_bound("2024-01-15T10:00:00Z", "after") == "2024-01-15 10:00:00.000000000"
+    assert whatsapp._utc_bound("2024-01-15T10:00:00.123456789Z", "after") == "2024-01-15 10:00:00.123456789"
     aware = datetime(2024, 1, 15, 10, tzinfo=UTC)
-    assert whatsapp._utc_bound(aware.isoformat(), "before") == "2024-01-15 10:00:00.000"
+    assert whatsapp._utc_bound(aware.isoformat(), "before") == "2024-01-15 10:00:00.000000000"
+
+
+def test_instant_sql_normalises_offset_and_keeps_fraction():
+    conn = sqlite3.connect(":memory:")
+    cases = {
+        "2024-01-15 14:00:00.12335+02:00": "2024-01-15 12:00:00.123350000",
+        # Older SQLite releases round .9995 and up into the next second.
+        "2024-01-15 12:00:00.9999+00:00": "2024-01-15 12:00:00.999900000",
+        "2024-01-15 07:00:00.5-05:00": "2024-01-15 12:00:00.500000000",
+        "2024-01-15 12:00:00+00:00": "2024-01-15 12:00:00.000000000",
+        "2024-01-15T12:00:00.123456789Z": "2024-01-15 12:00:00.123456789",
+        "not a time": None,
+    }
+    for stored, key in cases.items():
+        assert conn.execute(f"SELECT {whatsapp._instant_sql('?1')}", (stored,)).fetchone()[0] == key, stored
