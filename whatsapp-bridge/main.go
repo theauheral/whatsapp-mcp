@@ -626,19 +626,34 @@ func (store *MessageStore) Close() error {
 	return waErr
 }
 
+// instantSQL returns an SQL expression rendering the timestamp in column as a
+// fixed-width UTC string, "YYYY-MM-DD HH:MM:SS.nnnnnnnnn", whose text order is
+// chronological order. NULL or unparseable values yield NULL.
+//
+// go-sqlite3 stores time.Time as local wall clock plus UTC offset with up to
+// nanosecond precision ("2026-10-25 01:30:00.1234+01:00"). Comparing two of
+// them as strings is only chronological while the offset never changes; across
+// a DST switch or a host timezone change "01:15:00+00:00" sorts before
+// "01:30:00+01:00" although it is the later instant. SQLite's date functions
+// apply the offset but keep only milliseconds, so julianday() reads .1233 and
+// .1234 as one instant. The whole seconds therefore come from strftime() on the
+// value with its fraction cut out, so no SQLite version's millisecond rounding
+// can carry into them, and the stored fraction digits are appended verbatim,
+// padded to nine; an offset never changes the sub-second part.
+func instantSQL(column string) string {
+	return strings.ReplaceAll(`(CASE WHEN substr($ts, 20, 1) = '.'
+		THEN strftime('%Y-%m-%d %H:%M:%S', substr($ts, 1, 19) || ltrim(substr($ts, 21), '0123456789'))
+			|| '.' || substr(substr($ts, 21, length($ts) - 20 - length(ltrim(substr($ts, 21), '0123456789'))) || '000000000', 1, 9)
+		ELSE strftime('%Y-%m-%d %H:%M:%S', $ts) || '.000000000'
+	END)`, "$ts", column)
+}
+
 // Store a chat in the database. An empty `name` preserves any existing
 // resolved contact/group name on the row — outbound-message persistence
 // doesn't have a friendly name available at send time and must not clobber
 // names set by inbound handling or history sync. last_message_time is
 // merged monotonically so out-of-order delivery (history sync, backfill)
 // can't move it backwards.
-// Timestamps are stored as go-sqlite3 renders time.Time: local wall clock plus
-// UTC offset ("2026-10-25 01:30:00+01:00"). Comparing two of them as strings is
-// only chronological while the offset never changes; across a DST switch or a
-// host timezone change "01:15:00+00:00" sorts before "01:30:00+01:00" although
-// it is the later instant. Every "is this newer" decision therefore goes
-// through julianday(), which SQLite evaluates on the instant.
-
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
 		`INSERT INTO chats (jid, name, last_message_time)
@@ -648,7 +663,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 			last_message_time = CASE
 				WHEN chats.last_message_time IS NULL THEN excluded.last_message_time
 				WHEN excluded.last_message_time IS NULL THEN chats.last_message_time
-				WHEN julianday(excluded.last_message_time) > julianday(chats.last_message_time) THEN excluded.last_message_time
+				WHEN `+instantSQL("excluded.last_message_time")+` > `+instantSQL("chats.last_message_time")+` THEN excluded.last_message_time
 				ELSE chats.last_message_time
 			END`,
 		jid, name, lastMessageTime,
@@ -699,7 +714,7 @@ func (store *MessageStore) MarkChatRead(jid string, readAt time.Time) error {
 			last_read_time = CASE
 				WHEN chats.last_read_time IS NULL THEN excluded.last_read_time
 				WHEN excluded.last_read_time IS NULL THEN chats.last_read_time
-				WHEN julianday(excluded.last_read_time) > julianday(chats.last_read_time) THEN excluded.last_read_time
+				WHEN `+instantSQL("excluded.last_read_time")+` > `+instantSQL("chats.last_read_time")+` THEN excluded.last_read_time
 				ELSE chats.last_read_time
 			END`,
 		jid, readAt,
@@ -802,7 +817,7 @@ func (store *MessageStore) MaxMessageTimestamp(chatJID string, ids []string) (ti
 	var raw any
 	err := store.db.QueryRow(
 		`SELECT timestamp FROM messages WHERE chat_jid = ? AND id IN (`+strings.Join(placeholders, ",")+`)
-		 ORDER BY julianday(timestamp) DESC LIMIT 1`,
+		 ORDER BY `+instantSQL("timestamp")+` DESC LIMIT 1`,
 		args...,
 	).Scan(&raw)
 	if err == sql.ErrNoRows {
