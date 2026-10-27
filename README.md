@@ -3,7 +3,7 @@
 [![CI](https://github.com/verygoodplugins/whatsapp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/verygoodplugins/whatsapp-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Go 1.25+](https://img.shields.io/badge/go-1.25+-00ADD8.svg)](https://go.dev/)
+[![Go 1.26+](https://img.shields.io/badge/go-1.26+-00ADD8.svg)](https://go.dev/)
 
 A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and send WhatsApp messages.
 
@@ -32,11 +32,25 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 
 ### Prerequisites
 
-- Go 1.25+
+- Go 1.26+
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) package manager
 - Claude Desktop or Cursor
 - FFmpeg (optional, for voice message conversion)
+
+**Intel macOS:** patched `cryptography` releases no longer provide Intel Mac
+wheels, so installation may compile this dependency from source. Install the
+Xcode Command Line Tools (`xcode-select --install`) and, with Homebrew,
+`brew install rust openssl@3 pkg-config`. Then install the Python dependencies:
+
+```bash
+cd whatsapp-mcp-server
+OPENSSL_DIR="$(brew --prefix openssl@3)" uv sync
+```
+
+Use a Rust toolchain supported by the installed `cryptography` release; see its
+[source-build instructions](https://cryptography.io/en/latest/installation/#building-cryptography-on-macos).
+Keep the patched dependency rather than restoring the old vulnerable version pin.
 
 ### Quick Start
 
@@ -259,6 +273,12 @@ When webhook forwarding is enabled, inbound reactions are also posted to `WEBHOO
 
 Send a media file (image, video, document).
 
+Successfully sent attachments retain their download metadata in local history.
+Use their message ID and chat JID with `download_media` to retrieve the uploaded
+bytes again while WhatsApp still serves the attachment. This also applies to
+voice messages sent with `send_audio_message`. It does not backfill metadata for
+attachments sent by older bridge versions or prevent WhatsApp media expiry.
+
 **Parameters:**
 
 - `recipient` (required): Phone number or group JID
@@ -268,6 +288,9 @@ Send a media file (image, video, document).
 The bridge only reads files inside configured media roots. By default this is
 `~/.local/share/whatsapp-mcp/outbox`; set `WHATSAPP_MEDIA_ROOTS` to allow
 additional absolute directories.
+
+For documents, recipients receive only the filename portion of `file_path`;
+parent directories are not exposed.
 
 #### `send_audio_message`
 
@@ -283,12 +306,82 @@ Converted audio is sent through the same media-path confinement as
 
 #### `download_media`
 
-Download media from a received message.
+Download media from a received message. Returns the **local file path**, which
+only helps a client that can read the filesystem — use `view_media` otherwise.
 
 **Parameters:**
 
 - `message_id` (required): ID of the message with media
 - `chat_jid` (required): JID of the chat containing the message
+
+#### `view_media`
+
+View the media of a message as an image, for clients with no filesystem access
+(Claude Desktop, a claude.ai chat). Images are returned as image content;
+a video returns its first frame as a still. Both are downscaled first so one
+photo cannot flood the context. Audio is rejected with a pointer to its
+transcript.
+
+Uses FFmpeg when available (already an optional dependency); without it, images
+below 4 MB are returned unchanged and anything else reports what is missing.
+
+**Parameters:**
+
+- `message_id` (required): ID of the message with media
+- `chat_jid` (required): JID of the chat containing the message
+- `max_dimension` (optional): longest edge in pixels, default `1024`
+
+`max_dimension` must be an integer from `1` to `2048`. Invalid values are
+rejected before the server downloads or renders any media.
+
+#### `transcribe_audio`
+
+Transcribe a voice note with whisper.cpp (the default) or an OpenAI-compatible
+endpoint and return its text. The transcript is also written into the message's
+empty `content` field, so afterwards it is readable through `list_messages`
+by any client — including one with no filesystem access — without transcribing
+again. whisper.cpp runs entirely on this machine; the HTTP provider sends audio
+to the endpoint you configure. Use a loopback URL to keep transcription local.
+
+A stored transcript is returned immediately; a fresh one took about 2 s for a
+30-second note with `large-v3-turbo` on an M-series Mac. Transcripts are
+prefixed with `[transcript (whisper <model>)]` or
+`[transcript (openai_compatible <model>)]` so they cannot be mistaken for
+text a human typed, and a real message is never overwritten.
+
+**Requirements:** [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+(`whisper-cli` on `PATH`), FFmpeg, and `WHISPER_MODEL` pointing at a model
+file. Optionally `WHISPER_LANGUAGE` (default `auto`).
+
+To reuse an existing service, such as a local Parakeet server, configure:
+
+```env
+WHATSAPP_TRANSCRIPTION_PROVIDER=openai_compatible
+WHATSAPP_TRANSCRIPTION_URL=http://127.0.0.1:8178/v1/audio/transcriptions
+WHATSAPP_TRANSCRIPTION_MODEL=parakeet
+```
+
+`WHATSAPP_TRANSCRIPTION_PROVIDER` defaults to `whisper_cpp`. For
+`openai_compatible`, URL and MODEL are required. URL is the **full endpoint**;
+no path is appended. Optional `WHATSAPP_TRANSCRIPTION_API_KEY` supplies a bearer
+token, and `WHATSAPP_TRANSCRIPTION_LANGUAGE` supplies a language code (`auto`
+by default, omitted from the HTTP request). This provider uploads the original
+audio using multipart `file`, `model`, and `response_format=json`; the server
+must decode it (including WhatsApp Opus/OGG) and return `{"text": "..."}`.
+It requires no local whisper.cpp, model file, or FFmpeg. Remote URLs send audio
+off the machine; redirects, environment proxies, `.netrc` credentials, and
+automatic provider fallbacks are disabled.
+HTTP connections time out after 10 seconds, HTTP reads and Whisper inference
+after 300 seconds, and local FFmpeg decoding after 60 seconds.
+
+Stored transcripts are reused across provider changes unless `force=true`.
+Cache reads and writes use both message ID and chat JID.
+
+**Parameters:**
+
+- `message_id` (required): ID of the message with the voice note
+- `chat_jid` (required): JID of the chat containing the message
+- `force` (optional): transcribe again even when a transcript is stored
 
 ### Chat Operations
 
@@ -388,11 +481,13 @@ Copy `.env.example` to `.env` and configure as needed:
 | `WHATSAPP_BRIDGE_PORT` | `8080`                                   | Port for Go bridge REST API                  |
 | `WEBHOOK_URL`          | `http://localhost:8769/whatsapp/webhook` | Webhook for incoming messages                |
 | `WEBHOOK_ENABLED`      | `true`                                   | Set to `false` to disable outbound webhooks  |
+| `WHATSAPP_AUTO_DOWNLOAD_MEDIA` | `true` | Automatically download incoming media, including webhook image bytes. `false` keeps webhook metadata/text without `mediaBase64` and leaves downloads to `/api/download` (`download_media`); delayed downloads may fail after media expires. Status messages are stored but never auto-downloaded or forwarded |
 | `FORWARD_SELF`         | `true`                                   | Forward messages sent by self                |
 | `WHATSAPP_DB_PATH`     | `../whatsapp-bridge/store/messages.db`   | Path to SQLite database                      |
 | `WHATSMEOW_DB_PATH`    | `../whatsapp-bridge/store/whatsapp.db`   | whatsmeow DB used for LID ↔ phone resolution |
 | `WHATSAPP_API_URL`     | `http://localhost:8080/api`              | Go bridge REST API URL                       |
 | `WHATSAPP_BRIDGE_TOKEN` | generated next to `WHATSMEOW_DB_PATH` as `.bridge-token` | Bearer token for bridge REST calls; also signed onto outbound webhook POSTs |
+| `WHATSAPP_HUB_URL` | `http://localhost:8767/ui/whatsapp` | AutoHub status/pairing page opened by macOS bridge notifications |
 | `WHATSAPP_MEDIA_ROOTS` | `~/.local/share/whatsapp-mcp/outbox`     | Path-list of directories allowed for outbound media files |
 | `WHATSAPP_DEVICE_NAME` | `whatsmeow` (whatsmeow default)          | Label shown for this connection under WhatsApp > Linked Devices. Set to a recognisable name. Applies at pair time only (re-pair to change) |
 | `WHATSAPP_MCP_TRANSPORT` | `stdio`                                | MCP transport to serve clients: `stdio`, `http`, or `sse` |
@@ -462,6 +557,161 @@ outbox is `~/.local/share/whatsapp-mcp/outbox`, created on bridge startup. Move
 files there before calling `send_file` or `send_audio_message`, or set
 `WHATSAPP_MEDIA_ROOTS` to a colon-separated list of absolute directories.
 
+### Connection status and phone linking
+
+The authenticated bridge API remains available before linking:
+
+- `GET /api/connection` returns `state`, `connected`, `paired`, `message`,
+  `qrCode`, `qrExpiresAt`, `updatedAt`, and `lastError` (`code`/`message` or null).
+  States are `connected`, `pairing`, `logged_out`, `disconnected`, `outdated`,
+  `connecting`, and `error`. QR values expire and refresh automatically; responses
+  use `Cache-Control: no-store`. Treat the QR as a short-lived pairing secret.
+- `POST /api/connection/reconnect` retries the saved session or requests a new
+  pairing QR if unpaired. Repeated requests share one connection attempt. It
+  never deletes the databases or logs QR data when running in the background.
+- `GET /api/health` keeps its 200/503 readiness behavior and includes the current
+  `state`, `paired`, `message`, and `lastError`, without QR data.
+
+AutoHub displays this status and QR at `/ui/whatsapp`. From your phone, use
+WhatsApp **Linked Devices → Link a Device**. A healthy existing session reconnects
+without scanning a new QR.
+
+### Where runtime data is stored
+
+The bridge keeps its runtime state in `store/`, resolved **relative to its
+working directory**. `WHATSAPP_DB_PATH` and `WHATSMEOW_DB_PATH` configure the
+MCP server's reads; they do not change the bridge's store location. That
+store contains:
+
+| Path | Contents |
+| --- | --- |
+| `whatsapp.db` | whatsmeow session state, including linked-device credentials |
+| `messages.db` | locally synced chat and message history |
+| `<chat_jid>/` | downloaded images, voice notes, documents, and other media |
+| `.bridge-token` | the generated REST API bearer token, unless supplied through the environment |
+
+The application does not encrypt these files at rest. Anyone who can read
+`whatsapp.db` can obtain the linked-device credentials. Moving the store does
+not automatically tighten permissions on existing files; check the destination's
+access permissions as part of the move. An encrypted volume adds protection
+when the machine or a backup is lost.
+
+> **Cloud-synced folders:** a checkout inside Google Drive, Dropbox, iCloud
+> Drive, or OneDrive puts the default store within that service's sync scope.
+> Keep the checkout or its runtime store outside synced folders. Relocating
+> prevents future sync of that store; it does not remove copies or version
+> history already uploaded to a provider.
+
+#### Relocate an existing installation
+
+1. **Stop the bridge and every MCP server before copying or moving any files.**
+   Quit clients that launch the stdio server (such as Claude Desktop or Cursor),
+   stop any standalone HTTP/SSE MCP server, and disable automatic restarts while
+   migrating. The macOS jobs only manage the bridge and its monitor, so stopping
+   them does not stop MCP clients. If installed, unload both jobs:
+
+   ```bash
+   launchctl bootout "gui/$(id -u)/com.whatsapp-mcp.bridge-monitor"
+   launchctl bootout "gui/$(id -u)/com.whatsapp-mcp.bridge"
+   ```
+
+   For a manually started bridge, stop it in its terminal. Confirm all bridge
+   and MCP server processes have exited. Never copy live SQLite databases.
+
+2. Build the binary and move the **entire existing store**, including hidden
+   files and any SQLite `-wal`, `-shm`, or journal files, to an unsynced directory.
+   Replace the checkout path below, and use the same terminal for later examples.
+   If you already run the bridge from another working directory, use that
+   directory's `store/` as the source instead.
+
+   ```bash
+   repo_dir="/absolute/path/to/whatsapp-mcp"
+   runtime_dir="$HOME/.local/share/whatsapp-mcp/runtime"
+   (
+     set -eu
+     cd "$repo_dir/whatsapp-bridge"
+     go build -o whatsapp-bridge .
+     mkdir -p "$runtime_dir"
+     chmod 700 "$runtime_dir"
+     if [ -e "$runtime_dir/store" ] || [ -L "$runtime_dir/store" ]; then
+       echo "Destination store already exists; stop and inspect it before migrating." >&2
+       exit 1
+     fi
+     mv "$repo_dir/whatsapp-bridge/store" "$runtime_dir/store"
+   )
+   ```
+
+   Continue only if the move succeeds. Do not merge two stores or start with an
+   empty store to relocate an existing session: that creates a new session and
+   loses access to the existing local history.
+
+3. In **every MCP client or server configuration**, set both database paths to
+   the moved files, using absolute paths (JSON does not expand `$HOME` or `~`):
+
+   ```json
+   "env": {
+     "WHATSAPP_DB_PATH": "/Users/you/.local/share/whatsapp-mcp/runtime/store/messages.db",
+     "WHATSMEOW_DB_PATH": "/Users/you/.local/share/whatsapp-mcp/runtime/store/whatsapp.db"
+   }
+   ```
+
+   The MCP server reads `.bridge-token` beside `WHATSMEOW_DB_PATH` when
+   `WHATSAPP_BRIDGE_TOKEN` is unset. An explicit token takes precedence: preserve
+   the same value in the bridge, MCP clients, and any authenticated webhook
+   receiver. Keep token values private.
+
+4. Choose how to restart the bridge, then restart the MCP servers and clients
+   with their updated configuration:
+
+   **Manual:** launch the built binary from the new runtime directory:
+
+   ```bash
+   cd "$runtime_dir"
+   "$repo_dir/whatsapp-bridge/whatsapp-bridge"
+   ```
+
+   **macOS launchd:** before reloading either job, edit
+   `~/Library/Application Support/whatsapp-mcp/launchd.env` to set
+   `WHATSAPP_BRIDGE_DIR` to the absolute runtime directory. Keep
+   `WHATSAPP_BRIDGE_BINARY` pointing to the built binary in the checkout.
+   The runner explicitly executes `cd "$WHATSAPP_BRIDGE_DIR"`; changing only
+   the plist's `WorkingDirectory` does not relocate the store. Update that
+   plist value too so both directory settings agree:
+
+   ```bash
+   /usr/libexec/PlistBuddy -c "Set :WorkingDirectory $runtime_dir" \
+     "$HOME/Library/LaunchAgents/com.whatsapp-mcp.bridge.plist"
+   ```
+
+   Recent installers also capture `WHATSAPP_BRIDGE_TOKEN` in `launchd.env`,
+   which both the runner and monitor source. For a generated file token, ensure
+   that cached value matches the moved `store/.bridge-token`; update a stale
+   cached value privately before restarting. For an explicitly configured
+   token, retain the same override in all consumers. Changing
+   `WHATSAPP_BRIDGE_DIR` alone does not update the cached token. Keep
+   `launchd.env` owner-readable/writable only (`chmod 600`).
+
+   ```bash
+   launchctl bootstrap "gui/$(id -u)" \
+     "$HOME/Library/LaunchAgents/com.whatsapp-mcp.bridge.plist"
+   launchctl bootstrap "gui/$(id -u)" \
+     "$HOME/Library/LaunchAgents/com.whatsapp-mcp.bridge-monitor.plist"
+   ```
+
+   Check that the bridge reconnects with the existing session and that the MCP
+   client can read known history. An unexpected QR pairing prompt or empty
+   history is a reason to stop and recheck paths before proceeding.
+
+**Reinstalling:** the installer preserves existing runtime/store paths and saved
+settings from `launchd.env`; explicitly exported values override saved settings.
+It builds from the current checkout into the saved binary path. Existing session
+and message databases are left in place.
+
+**Fresh manual installation:** only when there is no session or history to
+preserve, omit the `mv` step, create the runtime directory, and launch the built
+binary there. Pair the new device, then point the MCP server at the new databases
+and token as above. This is separate from migrating an existing installation.
+
 ### Run automatically on macOS
 
 macOS users can install optional per-user `launchd` jobs that start the Go
@@ -483,7 +733,7 @@ It safely reloads only these labels:
 - `com.whatsapp-mcp.bridge-monitor`
 
 To customize the launchd environment, export values before running the installer.
-Re-run the installer after changing them.
+Re-run the installer after changing them; saved values are otherwise preserved.
 
 ```bash
 export WHATSAPP_BRIDGE_PORT=8080
@@ -502,10 +752,19 @@ tail -n 100 ~/Library/Logs/whatsapp-mcp/bridge.err.log
 tail -n 100 ~/Library/Logs/whatsapp-mcp/monitor.err.log
 ```
 
-The monitor sends a macOS notification once per failure type until recovery. It
-alerts when the bridge LaunchAgent is unloaded, the token is missing, the health
-endpoint is unreachable, WhatsApp is disconnected, or recent logs indicate that
-QR relinking is needed.
+The monitor reports the actual connection cause: an outdated client needs a
+bridge update; a logged-out or unpaired device needs phone linking; a temporary
+disconnection is retried automatically. It deduplicates repeated alerts, reminds
+you after six hours of persistent failure, and reports connection recovery.
+Notifications open `WHATSAPP_HUB_URL` when `terminal-notifier` is installed;
+the standard macOS fallback includes the same URL in its text.
+
+If `store/.bridge-token` lives inside a macOS TCC-protected location (for example
+`~/Documents` or `~/Desktop`), the sandboxed monitor can be denied read access to
+it. The installer avoids this by copying the resolved token into the mode-`600`
+`launchd.env` so the monitor reads it from the environment; if you ever see the
+monitor exit without alerting, re-run the installer, or set `WHATSAPP_BRIDGE_TOKEN`
+explicitly before running it.
 
 Uninstall the generated LaunchAgents and support files with:
 
@@ -548,6 +807,21 @@ Caveats:
 - **The phone decides the actual cap.** The flag requests up to 10 years / 100 GB, but WhatsApp's iOS primary device enforces its own retention policy. iPad companion is documented at ~1 year max; other linked devices appear to follow similar logic.
 - **Only effective on a fresh pair.** With `whatsapp.db` already present, no new pair handshake fires and the flag is a no-op.
 - **Messages the phone has deleted are not recoverable** — auto-expire, low-storage cleanup, and manual delete all leave no trace for the phone to share.
+
+History sync preserves the same supported message text as live reception,
+including WhatsApp Business templates, button messages, and image/video/document
+captions. Shared contact cards are searchable text containing the display name
+and phone numbers; they do not require a media download. Live contact cards
+retain reply context and disappearing-message settings. Raw history envelopes
+are unwrapped using the same parser as live events. This applies to both
+active and archived chats. The fix does not
+retroactively restore text skipped by an older bridge: the affected messages
+must be delivered again through history sync, subject to the phone's limits.
+
+Chat activity timestamps follow the newest history message stored as supported
+text or media. Protocol-only entries do not advance chat activity. Their read
+and disappearing-message settings are retained, while metadata-only rows are
+excluded from chat listings until a message or reaction is stored.
 
 ### Requesting history for a single chat (on-demand)
 
@@ -766,6 +1040,13 @@ are documented in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Troubleshooting
 
+### Chat names show phone numbers
+
+The bridge retries name resolution when a stored chat name is a numeric
+placeholder. It also repairs DMs previously named after your own account number
+when another message or history-sync event reaches that chat. Real stored names
+are preserved.
+
 ### Authentication Issues
 
 - **Pairing fails with `Client outdated` or HTTP 405**: Update to the latest
@@ -773,8 +1054,17 @@ are documented in [docs/RELEASING.md](docs/RELEASING.md).
   supported linked-device client version, which can make older whatsmeow builds
   fail before pairing completes.
 - **QR Code Not Displaying**: Restart the bridge. Check terminal QR code support.
+- **Phone says "check your connection" after scanning**: WhatsApp answers a scan
+  with a `companion_reg_refresh` notification, whatsmeow rotates the pairing
+  secret, and the bridge prints a **new** QR code marked `QR code refreshed`.
+  Scan that one — the earlier code is dead at that point. Needs a whatsmeow
+  build from 2026-09-15 or later; older ones never emit the rotated code.
 - **Device Limit Reached**: Remove a linked device from WhatsApp Settings > Linked Devices.
 - **No Messages Loading**: Initial sync can take several minutes for large chat histories.
+- **MCP tools fail with `WhatsApp messages database not found`**: The MCP
+  server opens `messages.db` read-only and refuses to create it. Start the
+  bridge once so it creates `whatsapp-bridge/store/messages.db`, or set
+  `WHATSAPP_DB_PATH` to wherever it lives.
 - **Out of Sync**: Back up `whatsapp-bridge/store`, then move
   `whatsapp-bridge/store/whatsapp.db` aside and re-authenticate. Keep
   `messages.db` unless you intentionally want to discard local message history.
@@ -839,6 +1129,13 @@ go run .
 ## Security Notice
 
 > **Caution**: As with many MCP servers, this is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). Prompt injection could lead to private data exfiltration. Use with awareness.
+
+On Unix-like systems, newly created bridge `store/` and per-chat media
+directories request owner-only permissions (`0700`), and newly downloaded media
+files request `0600`. This is local filesystem defense-in-depth; it does not
+encrypt data or protect it from privileged users, backups, or sync services.
+Existing directories and files retain their permissions: the bridge does not
+recursively change an existing store tree.
 
 ## License
 
