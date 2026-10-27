@@ -1,12 +1,20 @@
 import os
 import signal
 import sys
-from typing import Any
+import tempfile
+from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
+from pydantic import Field
 
+import media_preview
+import transcription
 from mcp_config import resolve_host, resolve_port, resolve_transport
 from parent_watchdog import install_stdio_parent_watchdog
+from whatsapp import (
+    MESSAGES_DB_PATH,
+    msg_to_dict,
+)
 from whatsapp import (
     download_media as whatsapp_download_media,
 )
@@ -38,9 +46,6 @@ from whatsapp import (
     mark_messages_read as whatsapp_mark_messages_read,
 )
 from whatsapp import (
-    msg_to_dict,
-)
-from whatsapp import (
     search_contacts as whatsapp_search_contacts,
 )
 from whatsapp import (
@@ -59,6 +64,16 @@ from whatsapp import (
 # Initialize FastMCP server. Env-var handling is deferred to the __main__ block
 # so importing this module never parses env vars or exits the process.
 mcp = FastMCP("whatsapp")
+
+PreviewDimension = Annotated[
+    int,
+    Field(
+        strict=True,
+        ge=media_preview.MIN_MAX_DIMENSION,
+        le=media_preview.MAX_MAX_DIMENSION,
+        description="Longest preview edge in pixels; must be an integer from 1 to 2048.",
+    ),
+]
 
 
 @mcp.tool()
@@ -195,7 +210,8 @@ def list_messages(
         sort_by: "newest" (default, most recent first) or "oldest" (chronological)
     """
     # Cap limit at 500 to prevent excessive queries
-    limit = min(limit, 500)
+    limit = max(1, min(limit, 500))
+    page = max(0, page)
     messages = whatsapp_list_messages(
         after=after,
         before=before,
@@ -234,10 +250,12 @@ def list_chats(
         last_sender, last_is_from_me, last_read_time and unread. `last_read_time` is
         how far the chat has been read on any device (null if never reported); `unread`
         is true when the last message is inbound and newer than that marker, so chats
-        already read on the phone are not reported as unread.
+        already read on the phone are not reported as unread. Numeric fallback names
+        are resolved from local contacts when possible, even while the bridge is offline.
     """
     # Cap limit at 200 to prevent excessive queries
-    limit = min(limit, 200)
+    limit = max(1, min(limit, 200))
+    page = max(0, page)
     chats = whatsapp_list_chats(
         query=query, limit=limit, page=page, include_last_message=include_last_message, sort_by=sort_by
     )
@@ -279,6 +297,8 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
+    limit = max(1, min(limit, 200))
+    page = max(0, page)
     chats = whatsapp_get_contact_chats(jid, limit, page)
     return chats
 
@@ -462,6 +482,116 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
         return {"success": True, "message": "Media downloaded successfully", "file_path": file_path}
     else:
         return {"success": False, "message": "Failed to download media"}
+
+
+@mcp.tool()
+def view_media(
+    message_id: str,
+    chat_jid: str,
+    max_dimension: PreviewDimension = media_preview.DEFAULT_MAX_DIMENSION,
+) -> Any:
+    """View the media of a WhatsApp message as an image.
+
+    download_media only returns a local file path, which a client without
+    filesystem access cannot open. This returns the picture itself instead.
+    Videos return their first frame, which is enough to tell what was sent.
+    Both are downscaled so a single photo cannot flood the context. Voice notes
+    are not images — use transcribe_audio or read the transcript from the
+    message content with list_messages.
+
+    Args:
+        message_id: The ID of the message containing the media
+        chat_jid: The JID of the chat containing the message
+        max_dimension: Longest edge of the returned image in pixels (default 1024)
+
+    Returns:
+        Image content on success, otherwise a dictionary explaining why not
+    """
+    try:
+        media_preview.validate_max_dimension(max_dimension)
+    except media_preview.PreviewError as exc:
+        return {"success": False, "message": str(exc)}
+
+    file_path = whatsapp_download_media(message_id, chat_jid)
+    if not file_path:
+        return {"success": False, "message": "Failed to download media"}
+
+    with tempfile.TemporaryDirectory() as work_dir:
+        try:
+            data, image_format = media_preview.render_preview(file_path, max_dimension=max_dimension, work_dir=work_dir)
+        except media_preview.PreviewError as exc:
+            return {"success": False, "message": str(exc), "file_path": file_path}
+
+    return Image(data=data, format=image_format)
+
+
+@mcp.tool()
+def transcribe_audio(message_id: str, chat_jid: str, force: bool = False) -> dict[str, Any]:
+    """Transcribe a WhatsApp voice note and return its text.
+
+    Runs whisper.cpp locally by default, or sends audio to the operator's
+    configured OpenAI-compatible endpoint. The transcript is also written into
+    the message's empty content field, so afterwards it is readable through list_messages by any
+    client — including one with no filesystem access — without transcribing
+    again.
+
+    Call this for a voice note whose content field is still empty. Requires
+    whisper.cpp, FFmpeg, and WHISPER_MODEL for the default provider; alternatively
+    configure WHATSAPP_TRANSCRIPTION_PROVIDER=openai_compatible, URL and MODEL.
+
+    Args:
+        message_id: The ID of the message containing the voice note
+        chat_jid: The JID of the chat containing the message
+        force: Transcribe again even when a transcript is already stored
+
+    Returns:
+        A dictionary with success status and the transcript
+    """
+    if not force:
+        existing = transcription.stored_transcript(MESSAGES_DB_PATH, message_id, chat_jid)
+        if existing:
+            return {"success": True, "message": "Transcript already stored", "transcript": existing}
+
+    # WhatsApp expires media server-side after a few weeks, so the file has to
+    # be on disk. This is a no-op when the bridge already downloaded it.
+    file_path = whatsapp_download_media(message_id, chat_jid)
+    if not file_path:
+        return {
+            "success": False,
+            "message": (
+                "Could not obtain the audio file. WhatsApp expires media after a while, "
+                "so an old voice note may no longer be downloadable."
+            ),
+        }
+    if not transcription.is_audio(file_path):
+        return {
+            "success": False,
+            "message": "This message is not audio. Use download_media instead.",
+            "file_path": file_path,
+        }
+
+    try:
+        provider = transcription.provider_name()
+        model = transcription.configured_model(provider)
+        with tempfile.TemporaryDirectory() as work_dir:
+            text = transcription.transcribe_file(file_path, work_dir, model=model, provider=provider)
+    except transcription.TranscriptionError as exc:
+        return {"success": False, "message": str(exc)}
+
+    if not transcription.store_transcript(MESSAGES_DB_PATH, message_id, chat_jid, text, model, provider=provider):
+        # The words are worth returning even when the row could not be updated,
+        # but say so: without the row, list_messages will not show them.
+        return {
+            "success": True,
+            "message": "Transcribed, but the transcript could not be stored on the message row",
+            "transcript": text,
+        }
+
+    return {
+        "success": True,
+        "message": "Transcribed",
+        "transcript": f"{transcription.label(model, provider)}{text}",
+    }
 
 
 def shutdown_handler(signum, frame):

@@ -71,26 +71,9 @@ uv run ruff check .         # lint
 uv run ruff format .        # format
 ```
 
-## CI gates
+## PR review and CI
 
-Every PR runs (see `.github/workflows/`). Not every job is blocking today:
-
-**Blocking — must be green to merge:**
-
-- `Python Lint` (`ruff check` + `ruff format --check`)
-- `Python Tests` (`pytest`)
-- `Go Lint` (`golangci-lint`)
-- `Go Build`
-- `Version Consistency` (Python pkg version vs `.release-please-manifest.json`)
-- `CodeQL Analysis (Python | Go)`
-
-**Informational — runs on every PR but won't fail the build today (`continue-on-error: true`):**
-
-- `Bandit Security Scan`
-- `Python Dependency Audit` (`pip-audit`)
-- `Go Vulnerability Check` (`govulncheck`)
-
-A failing blocking job is a hard block — fix it or explain in the PR why it's unrelated. For informational scans, investigate findings and either fix them or note in the PR why they're acceptable.
+For PR creation, hosted review, CI, and merge readiness, use the installed `babysit` skill (`~/.autovault/skills/babysit/SKILL.md`) as the canonical procedure.
 
 ## Environment variables
 
@@ -101,6 +84,7 @@ A failing blocking job is a hard block — fix it or explain in the PR why it's 
 | `WHATSAPP_API_URL` | `http://localhost:8080/api` | Bridge REST endpoint |
 | `WHATSAPP_BRIDGE_PORT` | `8080` | Port the bridge binds to |
 | `WHATSAPP_BRIDGE_TOKEN` | generated next to `WHATSMEOW_DB_PATH` as `.bridge-token` | Bearer token required for bridge REST calls |
+| `WHATSAPP_HUB_URL` | `http://localhost:8767/ui/whatsapp` | AutoHub status/pairing page opened by macOS bridge notifications |
 | `WHATSAPP_MEDIA_ROOTS` | `~/.local/share/whatsapp-mcp/outbox` | Path-list of directories allowed for outbound media files |
 | `WHATSAPP_DEVICE_NAME` | `whatsmeow` (whatsmeow default) | Linked-device label shown in WhatsApp > Linked Devices. Applied at pair time only (`store.DeviceProps.Os`); re-pair to change |
 | `WHATSAPP_MCP_TRANSPORT` | `stdio` | MCP transport to serve clients: `stdio`, `http`, or `sse` |
@@ -108,8 +92,16 @@ A failing blocking job is a hard block — fix it or explain in the PR why it's 
 | `WHATSAPP_MCP_PORT` | `8000` | Port for the `http`/`sse` transports |
 | `WEBHOOK_URL` | `http://localhost:8769/whatsapp/webhook` | Outgoing webhook for incoming messages (empty falls back to this default) |
 | `WEBHOOK_ENABLED` | `true` | Set to `false` to disable outbound webhooks entirely |
+| `WHATSAPP_AUTO_DOWNLOAD_MEDIA` | `true` | Automatically download incoming media, including webhook image bytes. `false` keeps webhook metadata/text without `mediaBase64` and leaves downloads to `/api/download` (`download_media`); delayed downloads may fail after media expires. Status messages are stored but never auto-downloaded or forwarded |
 | `FORWARD_SELF` | `true` | Whether self-sent messages are forwarded (`getEnvBool` default; set `FORWARD_SELF=false` to disable) |
 | `WHATSAPP_PARENT_WATCHDOG_S` | `30` | Stdio parent-liveness poll interval (seconds). Exits when the original parent is gone (POSIX reparent). Soft stdin EOF alone does not exit. |
+| `WHISPER_MODEL` | unset | Required model-file path for default whisper.cpp transcription |
+| `WHISPER_LANGUAGE` | `auto` | Language for whisper.cpp transcription |
+| `WHATSAPP_TRANSCRIPTION_PROVIDER` | `whisper_cpp` | `whisper_cpp` or `openai_compatible`; transcription is opt-in via the tool |
+| `WHATSAPP_TRANSCRIPTION_URL` | unset | Required full HTTP(S) endpoint for `openai_compatible`; audio is uploaded here, use loopback to keep it local |
+| `WHATSAPP_TRANSCRIPTION_MODEL` | unset | Required model ID for the HTTP provider (e.g. `parakeet`) |
+| `WHATSAPP_TRANSCRIPTION_LANGUAGE` | `auto` | HTTP provider language; `auto` omits the language field |
+| `WHATSAPP_TRANSCRIPTION_API_KEY` | unset | Optional bearer token for the HTTP provider |
 
 When adding a new env var: document it here, in `README.md`, and in `.env.example`.
 
@@ -119,8 +111,9 @@ When adding a new env var: document it here, in `README.md`, and in `.env.exampl
 2. **Media files** live under `store/{chat_jid}/` with timestamp + message-ID filenames. Don't hand-construct these paths in client code; use the bridge's `/api/download` endpoint.
 3. **Audio.** WhatsApp voice messages must be Opus `.ogg`. The MCP server's `send_audio_message` tool auto-converts via FFmpeg if installed.
 4. **History sync** is controlled by the *primary* device (the phone). The bridge can request more at pair time (see the `--full-history-pair` flag) or for a single chat at runtime (`POST /api/history`, see `history_ondemand.go`), but the phone has the final word.
-5. **`messages.db` is the source of truth for the MCP server.** Don't make the MCP server dependent on the bridge being up for *read* operations.
+5. **`messages.db` is the source of truth for the MCP server.** Don't make the MCP server dependent on the bridge being up for *read* operations. The server opens it read-only via `_connect_messages_db()` and raises `FileNotFoundError` if it is missing rather than letting `sqlite3.connect` create an empty one; keep new read paths on that helper.
 6. **Outgoing calls are not visible to linked devices.** Don't promise features that depend on them.
+7. **Intel macOS dependency builds.** Patched `cryptography` is required even when Intel Mac wheels are unavailable. Source builds need Rust, OpenSSL, pkg-config, and Xcode Command Line Tools (see README prerequisites); do not restore the old `<49` pin to avoid installing build tools.
 
 ## Where to make changes
 
